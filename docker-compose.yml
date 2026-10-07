@@ -1,0 +1,35 @@
+name: fmp4-audit
+
+services:
+  api:
+    build:
+      context: .
+      target: runtime
+    image: fmp4-audit-api
+    environment:
+      PORT: "8080"
+    ports:
+      # Host port is configurable: API_PORT=9000 docker compose up api
+      - "${API_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "/server", "healthcheck"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 5s
+    restart: unless-stopped
+
+  # One-shot verification: waits for the API to be healthy, runs the Go unit
+  # tests, build checks and the HTTP smoke suite, then exits 0 (pass) or
+  # non-zero (fail).
+  verify:
+    build:
+      context: .
+      target: verify
+    image: fmp4-audit-verify
+    environment:
+      API_URL: "http://api:8080"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: "no"
