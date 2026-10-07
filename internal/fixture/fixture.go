@@ -132,6 +132,15 @@ func buildTrak(trackID uint32, handler string, timescale uint32) []byte {
 	return Box("trak", cat(tkhd, mdia))
 }
 
+// PrftSpec configures a producer reference time box emitted immediately
+// before the moof (the clock anchor required in clock=prft mode).
+type PrftSpec struct {
+	TrackID   uint32  // reference_track_ID; 0 = the segment's tfhd track ID
+	NTP       uint64  // 64-bit NTP timestamp (32.32 fixed-point seconds)
+	MediaTime *uint64 // media_time; nil = the segment's BaseTime
+	V0        bool    // emit a version 0 prft (32-bit media_time) instead of version 1
+}
+
 // MediaOpts configures MediaSegment.
 type MediaOpts struct {
 	Seq          uint32
@@ -139,9 +148,10 @@ type MediaOpts struct {
 	BaseTime     uint64 // tfdt baseMediaDecodeTime
 	TfdtV0       bool   // write tfdt version 0 instead of version 1
 	Samples      []Sample
-	SecondTrun   []Sample // optional second trun in the same traf
-	TfhdDefaults bool     // carry duration/size as tfhd defaults, not per-sample
-	InheritTrex  bool     // no per-sample values and no tfhd defaults (trex only)
+	SecondTrun   []Sample  // optional second trun in the same traf
+	TfhdDefaults bool      // carry duration/size as tfhd defaults, not per-sample
+	InheritTrex  bool      // no per-sample values and no tfhd defaults (trex only)
+	Prft         *PrftSpec // emit a prft anchor immediately before the moof
 
 	OmitTfdt bool
 	OmitTrun bool
@@ -153,8 +163,8 @@ type MediaOpts struct {
 	SecondOverlap uint32 // shift second trun's data_offset back by this many bytes
 }
 
-// MediaSegment builds an fMP4 media segment: styp, moof(mfhd, traf(tfhd,
-// tfdt, trun...)), mdat.
+// MediaSegment builds an fMP4 media segment: styp, [prft,] moof(mfhd,
+// traf(tfhd, tfdt, trun...)), mdat.
 func MediaSegment(o MediaOpts) []byte {
 	if o.TrackID == 0 {
 		o.TrackID = 1
@@ -222,6 +232,25 @@ func MediaSegment(o MediaOpts) []byte {
 	}
 	moof := assemble(truns)
 
+	// The prft anchor sits immediately before the moof; it does not affect
+	// the trun data_offset, which is relative to the moof start.
+	var prft []byte
+	if o.Prft != nil {
+		trackID := o.Prft.TrackID
+		if trackID == 0 {
+			trackID = o.TrackID
+		}
+		mediaTime := o.BaseTime
+		if o.Prft.MediaTime != nil {
+			mediaTime = *o.Prft.MediaTime
+		}
+		if o.Prft.V0 {
+			prft = fullBox("prft", 0, 0, cat(be32(trackID), be64(o.Prft.NTP), be32(uint32(mediaTime))))
+		} else {
+			prft = fullBox("prft", 1, 0, cat(be32(trackID), be64(o.Prft.NTP), be64(mediaTime)))
+		}
+	}
+
 	var mdat []byte
 	if !o.OmitMdat {
 		n := totalSize(o.Samples) + totalSize(o.SecondTrun) + o.MdatPadTail - o.MdatTruncate
@@ -236,7 +265,7 @@ func MediaSegment(o MediaOpts) []byte {
 	}
 
 	styp := Box("styp", cat([]byte("msdh"), be32(0), []byte("msdhmsix")))
-	return cat(styp, moof, mdat)
+	return cat(styp, prft, moof, mdat)
 }
 
 func totalSize(samples []Sample) int {

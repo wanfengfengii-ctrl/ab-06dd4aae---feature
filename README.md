@@ -4,6 +4,10 @@
 避免播放器自动容错掩盖**音频重叠、空洞或载荷错配**。任何盒结构、参数继承、载荷
 边界或时间衔接不合法的提交都会以稳定错误码拒收。
 
+对同步水声阵列等带制作参考时钟的录音，可选用 `clock=prft` 模式：在既有时间线审计
+之上，逐片段核对 `prft` 锚点并测量**媒体时钟相对 NTP 参考时钟的漂移**，超出容差即
+拒收；不带参考时钟的旧素材仍按原契约接纳。
+
 ## 快速开始
 
 ```sh
@@ -36,6 +40,14 @@ go run ./cmd/smoke -url http://127.0.0.1:8080   # HTTP 冒烟
 
 part 字段名不限，顺序即语义。所有 part 合计不得超过 **16 MiB**。
 
+可选查询参数（URL query，两者须同时提供或同时省略）：
+
+- `clock=prft`：启用制作参考时钟审计；
+- `maxClockSkewUs`：允许的相邻锚点时钟偏差上限，整数，**1–1000000** 微秒。
+
+省略两者时请求契约、错误优先级与接纳范围与旧版完全一致；参数缺失、组合不当或
+越界以 `400 BAD_CLOCK_PARAMS` 拒绝。
+
 服务端从初始化片段解析轨道时标（`mdhd`）、轨道 ID（`tkhd`）、`trex` 默认采样参数，
 从每个媒体片段的 `tfhd`/`tfdt`/`trun` 解析实际采样时长与载荷范围，并校验：
 
@@ -45,6 +57,14 @@ part 字段名不限，顺序即语义。所有 part 合计不得超过 **16 MiB
 - 采样时长/大小按 `trun` → `tfhd` → `trex` 继承且可解析；
 - 每个 `trun` 的载荷区间落在本片段 `mdat` 内、互不重叠、且 `mdat` 字节被完全消费；
 - 相邻片段的解码区间**精确衔接**（`next.start == prev.end`，无空洞、无重叠）。
+
+启用 `clock=prft` 时，上述审计全部通过后追加参考时钟校验（旧版错误码优先）：
+
+- 每个 `moof` 前必须**紧邻**一个顶层 `prft` 盒（version 1）；
+- `prft.reference_track_ID` 必须等于初始化片段轨道 ID；
+- `prft.media_time` 必须等于对应片段的起始解码刻度（`tfdt`）；
+- 64 位 NTP 32.32 时间戳按提交顺序**严格递增**；
+- 相邻锚点：|NTP 经过时长 − 轨道时标换算的解码时长| ≤ `maxClockSkewUs`（精确大数比较，相等视为通过）。
 
 #### 成功响应 `200 OK`
 
@@ -62,6 +82,14 @@ part 字段名不限，顺序即语义。所有 part 合计不得超过 **16 MiB
     {"index": 1, "segmentIndex": 1, "sequenceNumber": 2, "start": 3072, "end": 6144, "duration": 3072, "samples": 3}
   ]
 }
+```
+
+`clock=prft` 模式下每个片段额外携带锚点信息：`mediaTime`（`prft.media_time`，等于
+`start`）与 `ntpTimestamp`（64 位 NTP 32.32 时间戳，16 位小写十六进制字符串）：
+
+```json
+{"index": 1, "segmentIndex": 1, "sequenceNumber": 2, "start": 3072, "end": 6144,
+ "duration": 3072, "samples": 3, "mediaTime": 3072, "ntpTimestamp": "e8a5b3c410624dd3"}
 ```
 
 #### 失败响应 `4xx`（内容审计失败为 `422`）
@@ -95,6 +123,7 @@ part 字段名不限，顺序即语义。所有 part 合计不得超过 **16 MiB
 | `BAD_MULTIPART` | 400 | multipart 结构非法或缺少 part |
 | `NO_MEDIA_SEGMENTS` | 400 | 只有初始化片段，没有媒体片段 |
 | `TOO_MANY_SEGMENTS` | 400 | 媒体片段超过 32 个 |
+| `BAD_CLOCK_PARAMS` | 400 | `clock`/`maxClockSkewUs` 缺失、组合不当或越界 |
 | `PAYLOAD_TOO_LARGE` | 413 | 合计超过 16 MiB |
 | `METHOD_NOT_ALLOWED` | 405 | 非 POST 请求 |
 | `BOX_STRUCTURE_INVALID` | 422 | 盒大小/截断/版本等结构非法 |
@@ -112,6 +141,11 @@ part 字段名不限，顺序即语义。所有 part 合计不得超过 **16 MiB
 | `PAYLOAD_NOT_CONSUMED` | 422 | mdat 存在未被引用的字节 |
 | `TIMELINE_GAP` | 422 | 相邻解码区间存在空洞 |
 | `TIMELINE_OVERLAP` | 422 | 相邻解码区间存在重叠 |
+| `MISSING_PRFT` | 422 | `moof` 前缺少紧邻的顶层 `prft` 锚点 |
+| `PRFT_TRACK_MISMATCH` | 422 | `prft.reference_track_ID` 与初始化轨道不符 |
+| `PRFT_MEDIA_TIME_MISMATCH` | 422 | `prft.media_time` 不等于片段起始解码刻度 |
+| `PRFT_NTP_NOT_INCREASING` | 422 | NTP 时间戳未按提交顺序严格递增 |
+| `CLOCK_SKEW_EXCEEDED` | 422 | 相邻锚点的时钟偏差超过 `maxClockSkewUs` |
 
 ## 交付结构
 
@@ -119,12 +153,12 @@ part 字段名不限，顺序即语义。所有 part 合计不得超过 **16 MiB
 Dockerfile            # 多阶段：build / runtime(scratch) / verify
 docker-compose.yml    # api（健康检查、API_PORT 可配宿主机端口）+ verify（一次性）
 cmd/server            # API 服务（含 healthcheck 子命令）
-cmd/smoke             # HTTP 冒烟客户端（连续 + 断裂时间线）
-internal/fmp4         # ISO BMFF 解析与审计逻辑
+cmd/smoke             # HTTP 冒烟客户端（连续/断裂时间线 + 参考时钟漂移）
+internal/fmp4         # ISO BMFF 解析、时间线与 prft 参考时钟审计
 internal/fixture      # 测试用 fMP4 构造器（单测与冒烟共用）
 scripts/verify.sh     # verify 服务入口：go test → vet/build → 等待健康 → 冒烟
 ```
 
 `verify` 服务通过 `depends_on: service_healthy` 等待 API 健康，随后执行
-`go test ./...`、`go vet ./...`、`go build`，再对活动 API 跑连续与断裂时间线的
-HTTP 冒烟，全部通过以退出码 0 结束，任一失败以非 0 结束。
+`go test ./...`、`go vet ./...`、`go build`，再对活动 API 跑连续与断裂时间线、
+合法参考时钟及超限漂移的 HTTP 冒烟，全部通过以退出码 0 结束，任一失败以非 0 结束。

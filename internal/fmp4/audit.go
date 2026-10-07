@@ -24,6 +24,11 @@ type FragmentReport struct {
 	End            uint64 `json:"end"`
 	Duration       uint64 `json:"duration"`
 	Samples        uint32 `json:"samples"`
+	// Set only in clock=prft mode: the fragment's validated prft anchor.
+	// MediaTime mirrors the prft media_time (equal to Start); NtpTimestamp
+	// is the 64-bit NTP 32.32 timestamp as 16 lowercase hex digits.
+	MediaTime    *uint64 `json:"mediaTime,omitempty"`
+	NtpTimestamp string  `json:"ntpTimestamp,omitempty"`
 }
 
 // Report is the result of a successful audit.

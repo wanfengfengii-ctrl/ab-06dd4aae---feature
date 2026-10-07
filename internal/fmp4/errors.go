@@ -12,6 +12,7 @@ const (
 	CodeNoMediaSegments  = "NO_MEDIA_SEGMENTS"
 	CodeTooManySegments  = "TOO_MANY_SEGMENTS"
 	CodeMethodNotAllowed = "METHOD_NOT_ALLOWED"
+	CodeBadClockParams   = "BAD_CLOCK_PARAMS"
 
 	// Box structure (init or media segment).
 	CodeBoxStructureInvalid = "BOX_STRUCTURE_INVALID"
@@ -47,6 +48,13 @@ const (
 	// Decode timeline continuity.
 	CodeTimelineGap     = "TIMELINE_GAP"
 	CodeTimelineOverlap = "TIMELINE_OVERLAP"
+
+	// Producer reference clock (clock=prft mode).
+	CodeMissingPrft           = "MISSING_PRFT"
+	CodePrftTrackMismatch     = "PRFT_TRACK_MISMATCH"
+	CodePrftMediaTimeMismatch = "PRFT_MEDIA_TIME_MISMATCH"
+	CodePrftNtpNotIncreasing  = "PRFT_NTP_NOT_INCREASING"
+	CodeClockSkewExceeded     = "CLOCK_SKEW_EXCEEDED"
 )
 
 // AuditError describes a single rejected submission. SegmentIndex is the

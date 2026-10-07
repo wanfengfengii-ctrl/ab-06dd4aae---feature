@@ -9,12 +9,15 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"mime"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -25,6 +28,7 @@ const (
 	maxTotalBytes    = 16 << 20 // 16 MiB of segment payload per request
 	maxBodyBytes     = maxTotalBytes + 1<<20
 	maxMediaSegments = 32
+	maxClockSkewUs   = 1_000_000 // upper bound of the maxClockSkewUs query parameter
 )
 
 func main() {
@@ -121,6 +125,12 @@ func handleAudit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	clock, aerr := parseClockParams(r.URL.Query())
+	if aerr != nil {
+		writeError(w, http.StatusBadRequest, aerr)
+		return
+	}
+
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	mr := multipart.NewReader(r.Body, params["boundary"])
 
@@ -188,7 +198,7 @@ func handleAudit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rep, aerr := fmp4.Audit(init, segs)
+	rep, aerr := fmp4.AuditClock(init, segs, clock)
 	if aerr != nil {
 		writeError(w, http.StatusUnprocessableEntity, aerr)
 		return
@@ -201,6 +211,39 @@ func handleAudit(w http.ResponseWriter, r *http.Request) {
 		TotalDuration: rep.TotalDuration,
 		Fragments:     rep.Fragments,
 	})
+}
+
+// parseClockParams validates the optional reference-clock query parameters.
+// With neither parameter present the request keeps the legacy contract.
+// clock=prft requires maxClockSkewUs in [1, 1000000] microseconds; any other
+// combination is rejected with BAD_CLOCK_PARAMS.
+func parseClockParams(q url.Values) (fmp4.ClockOpts, *fmp4.AuditError) {
+	mode := q.Get("clock")
+	skew := q.Get("maxClockSkewUs")
+	if mode == "" && skew == "" {
+		return fmp4.ClockOpts{}, nil
+	}
+	bad := func(format string, args ...any) (fmp4.ClockOpts, *fmp4.AuditError) {
+		return fmp4.ClockOpts{}, &fmp4.AuditError{
+			Code:         fmp4.CodeBadClockParams,
+			Message:      fmt.Sprintf(format, args...),
+			SegmentIndex: -1, FragmentIndex: -1,
+		}
+	}
+	if mode == "" {
+		return bad("maxClockSkewUs requires clock=prft")
+	}
+	if mode != "prft" {
+		return bad("unsupported clock mode %q, expected \"prft\"", mode)
+	}
+	if skew == "" {
+		return bad("clock=prft requires maxClockSkewUs (1..%d microseconds)", maxClockSkewUs)
+	}
+	us, err := strconv.ParseUint(skew, 10, 64)
+	if err != nil || us < 1 || us > maxClockSkewUs {
+		return bad("maxClockSkewUs must be an integer between 1 and %d", maxClockSkewUs)
+	}
+	return fmp4.ClockOpts{Enabled: true, MaxSkewUs: us}, nil
 }
 
 func multipartErrCode(err error) string {
