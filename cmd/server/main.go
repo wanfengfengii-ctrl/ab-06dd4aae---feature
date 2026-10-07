@@ -9,12 +9,14 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"mime"
 	"mime/multipart"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -112,6 +114,12 @@ func handleAudit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	opts, aerr := parseClockOptions(r)
+	if aerr != nil {
+		writeError(w, http.StatusBadRequest, aerr)
+		return
+	}
+
 	mediaType, params, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	if err != nil || mediaType != "multipart/form-data" || params["boundary"] == "" {
 		writeError(w, http.StatusBadRequest, &fmp4.AuditError{
@@ -188,7 +196,7 @@ func handleAudit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rep, aerr := fmp4.Audit(init, segs)
+	rep, aerr := fmp4.AuditWithOptions(init, segs, opts)
 	if aerr != nil {
 		writeError(w, http.StatusUnprocessableEntity, aerr)
 		return
@@ -201,6 +209,46 @@ func handleAudit(w http.ResponseWriter, r *http.Request) {
 		TotalDuration: rep.TotalDuration,
 		Fragments:     rep.Fragments,
 	})
+}
+
+// parseClockOptions maps the optional clock / maxClockSkewUs query parameters
+// onto audit options. With neither parameter present the legacy decode-only
+// contract applies; clock=prft requires a maxClockSkewUs in 1..1_000_000.
+func parseClockOptions(r *http.Request) (fmp4.Options, *fmp4.AuditError) {
+	q := r.URL.Query()
+	clock := q.Get("clock")
+	skewVals, hasSkew := q["maxClockSkewUs"]
+	reqErr := func(code, format string, args ...any) *fmp4.AuditError {
+		return &fmp4.AuditError{
+			Code:          code,
+			Message:       fmt.Sprintf(format, args...),
+			SegmentIndex:  -1,
+			FragmentIndex: -1,
+		}
+	}
+
+	switch clock {
+	case "":
+		if hasSkew {
+			return fmp4.Options{}, reqErr(fmp4.CodeInvalidMaxClockSkew,
+				"maxClockSkewUs is only accepted together with clock=prft")
+		}
+		return fmp4.Options{}, nil
+	case "prft":
+		if !hasSkew || skewVals[0] == "" {
+			return fmp4.Options{}, reqErr(fmp4.CodeMissingMaxClockSkew,
+				"clock=prft requires maxClockSkewUs between 1 and 1000000")
+		}
+		skew, err := strconv.ParseInt(skewVals[0], 10, 64)
+		if err != nil || skew < 1 || skew > 1_000_000 {
+			return fmp4.Options{}, reqErr(fmp4.CodeInvalidMaxClockSkew,
+				"maxClockSkewUs must be an integer between 1 and 1000000 microseconds")
+		}
+		return fmp4.Options{Clock: fmp4.ClockPrft, MaxClockSkewUs: skew}, nil
+	default:
+		return fmp4.Options{}, reqErr(fmp4.CodeUnknownClockMode,
+			"unsupported clock mode %q; only \"prft\" is supported", clock)
+	}
 }
 
 func multipartErrCode(err error) string {

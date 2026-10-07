@@ -1,6 +1,8 @@
 // Command smoke runs HTTP smoke tests against a live audit API: it submits
-// a continuous timeline (expecting success) and several broken timelines
-// (expecting the matching stable error codes).
+// a continuous timeline (expecting success), several broken timelines and
+// payloads (expecting the matching stable error codes), and the clock=prft
+// producer-reference-clock mode (valid anchors, missing/mis-owned/drifting
+// anchors, and request-parameter validation).
 //
 // Usage: smoke -url http://127.0.0.1:8080
 package main
@@ -34,13 +36,15 @@ type auditResponse struct {
 	FragmentCount int    `json:"fragmentCount"`
 	TotalDuration uint64 `json:"totalDuration"`
 	Fragments     []struct {
-		Index          int    `json:"index"`
-		SegmentIndex   int    `json:"segmentIndex"`
-		SequenceNumber uint32 `json:"sequenceNumber"`
-		Start          uint64 `json:"start"`
-		End            uint64 `json:"end"`
-		Duration       uint64 `json:"duration"`
-		Samples        uint32 `json:"samples"`
+		Index          int     `json:"index"`
+		SegmentIndex   int     `json:"segmentIndex"`
+		SequenceNumber uint32  `json:"sequenceNumber"`
+		Start          uint64  `json:"start"`
+		End            uint64  `json:"end"`
+		Duration       uint64  `json:"duration"`
+		Samples        uint32  `json:"samples"`
+		MediaTime      *uint64 `json:"mediaTime"`
+		NtpTimestamp   *string `json:"ntpTimestamp"`
 	} `json:"fragments"`
 	Error *errorBody `json:"error"`
 }
@@ -57,6 +61,9 @@ func main() {
 	checkContinuous(client, *url)
 	checkBrokenTimelines(client, *url)
 	checkBrokenPayloads(client, *url)
+	checkPrftClock(client, *url)
+	checkPrftRejects(client, *url)
+	checkPrftParams(client, *url)
 
 	if failures > 0 {
 		fmt.Printf("SMOKE FAILED: %d check(s) failed\n", failures)
@@ -196,11 +203,165 @@ func checkBrokenPayloads(client *http.Client, base string) {
 		422, "SAMPLE_DURATION_UNRESOLVABLE", 0, 0, bareInit, noDur)
 }
 
-// expectError posts init+segs and requires the given status, error code and
-// error indices.
-func expectError(client *http.Client, base, name string, wantStatus int, wantCode string, wantSeg, wantFrag int, init []byte, segs ...[]byte) {
+// ---- producer reference clock (clock=prft) ----
+
+// ntpStep is the NTP 32.32 duration of one 3072-tick fragment @48 kHz.
+const ntpStep = uint64(274_877_907)
+
+func anchored(seq uint32, base, ntp uint64) []byte {
+	return anchoredTrack(seq, base, ntp, 1)
+}
+
+func anchoredTrack(seq uint32, base, ntp uint64, trackID uint32) []byte {
+	return fixture.MediaSegment(fixture.MediaOpts{
+		Seq: seq, BaseTime: base, Samples: fixture.Samples(3, 1024, 16),
+		Prft: &fixture.PrftOpts{TrackID: trackID, Ntp: ntp, MediaTime: base},
+	})
+}
+
+// checkPrftClock exercises a properly anchored recording: legacy material is
+// still accepted without the clock parameter, the same recording is accepted
+// with clock=prft and reports per-fragment mediaTime/ntpTimestamp, and a drift
+// at the threshold boundary behaves exactly.
+func checkPrftClock(client *http.Client, base string) {
+	fmt.Println("[prft] valid producer reference clock")
+	init := fixture.InitSegment(fixture.InitOpts{
+		Timescale: 48000, TrackID: 1, TrexDuration: 1024, TrexSize: 16,
+	})
+	first := uint64(1) << 32
+	segs := [][]byte{
+		anchored(1, 0, first),
+		anchored(2, 3072, first+ntpStep),
+		anchored(3, 6144, first+2*ntpStep),
+	}
+
+	// Without clock= the anchors are simply ignored (old material accepted).
+	status, body, err := postAuditQ(client, base, "", init, segs...)
+	if err != nil {
+		fail("legacy post: %v", err)
+		return
+	}
+	if status != http.StatusOK || !body.OK {
+		fail("legacy anchored submission: status %d ok=%v", status, body.OK)
+		return
+	}
+	if body.Fragments[0].NtpTimestamp != nil || body.Fragments[0].MediaTime != nil {
+		fail("legacy response must not carry prft fields: %+v", body.Fragments[0])
+		return
+	}
+	pass("anchored material accepted under the legacy contract")
+
+	status, body, err = postAuditQ(client, base, "clock=prft&maxClockSkewUs=1000", init, segs...)
+	if err != nil {
+		fail("prft post: %v", err)
+		return
+	}
+	if status != http.StatusOK || !body.OK {
+		fail("status %d ok=%v error=%+v", status, body.OK, body.Error)
+		return
+	}
+	wantMedia := []uint64{0, 3072, 6144}
+	wantNtp := []string{"0000000100000000", "0000000110624dd3", "0000000120c49ba6"}
+	for i, f := range body.Fragments {
+		if f.MediaTime == nil || *f.MediaTime != wantMedia[i] {
+			fail("fragment %d mediaTime=%v, want %d", i, f.MediaTime, wantMedia[i])
+			return
+		}
+		if f.NtpTimestamp == nil || *f.NtpTimestamp != wantNtp[i] {
+			fail("fragment %d ntp=%v, want %q", i, f.NtpTimestamp, wantNtp[i])
+			return
+		}
+	}
+	pass("clock=prft accepted with mediaTime + lowercase ntpTimestamp")
+}
+
+// checkPrftRejects posts recordings with missing / mis-owned / drifting
+// anchors and requires the matching stable error codes and fragment indices.
+func checkPrftRejects(client *http.Client, base string) {
+	init := fixture.InitSegment(fixture.InitOpts{
+		Timescale: 48000, TrackID: 1, TrexDuration: 1024, TrexSize: 16,
+	})
+	first := uint64(1) << 32
+	q := "clock=prft&maxClockSkewUs=1000"
+
+	// Missing anchor: legacy segment without prft.
+	expectErrorQ(client, base, q, "moof without a preceding prft",
+		422, "MISSING_PRFT", 0, 0,
+		init,
+		fixture.MediaSegment(fixture.MediaOpts{
+			Seq: 1, BaseTime: 0, Samples: fixture.Samples(3, 1024, 16),
+		}))
+
+	// Anchor owned by a different track than the init segment.
+	expectErrorQ(client, base, q, "prft reference_track_ID mismatch",
+		422, "PRFT_TRACK_MISMATCH", 0, 0,
+		init, anchoredTrack(1, 0, first, 2))
+
+	// Anchor whose media_time does not equal the fragment start.
+	badMedia := fixture.MediaSegment(fixture.MediaOpts{
+		Seq: 1, BaseTime: 0, Samples: fixture.Samples(3, 1024, 16),
+		Prft: &fixture.PrftOpts{Ntp: first, MediaTime: 512},
+	})
+	expectErrorQ(client, base, q, "prft media_time off the fragment start",
+		422, "PRFT_MEDIA_TIME_MISMATCH", 0, 0, init, badMedia)
+
+	// NTP timestamp not strictly increasing.
+	expectErrorQ(client, base, q, "prft ntp not strictly increasing",
+		422, "PRFT_NTP_NOT_INCREASING", 1, 1,
+		init,
+		anchored(1, 0, first),
+		anchored(2, 3072, first))
+
+	// Producer clock runs ~1 ms fast while the decode timeline is exact.
+	expectErrorQ(client, base, "clock=prft&maxClockSkewUs=1",
+		"producer clock drifts beyond 1 us",
+		422, "CLOCK_DRIFT", 1, 1,
+		init,
+		anchored(1, 0, first),
+		anchored(2, 3072, first+ntpStep+4295))
+}
+
+// checkPrftParams validates request-shape handling of the query parameters.
+func checkPrftParams(client *http.Client, base string) {
+	init := fixture.InitSegment(fixture.InitOpts{
+		Timescale: 48000, TrackID: 1, TrexDuration: 1024, TrexSize: 16,
+	})
+	seg := anchored(1, 0, 1<<32)
+
+	expectParamError := func(name, query, wantCode string, wantStatus int) {
+		fmt.Printf("[reject] %s\n", name)
+		status, body, err := postAuditQ(client, base, query, init, seg)
+		if err != nil {
+			fail("post: %v", err)
+			return
+		}
+		if status != wantStatus || body.OK || body.Error == nil {
+			fail("status %d ok=%v error=%+v, want %d %s", status, body.OK, body.Error, wantStatus, wantCode)
+			return
+		}
+		if body.Error.Code != wantCode {
+			fail("code %q, want %q", body.Error.Code, wantCode)
+			return
+		}
+		pass("rejected with %s", wantCode)
+	}
+
+	expectParamError("clock=prft without maxClockSkewUs",
+		"clock=prft", "MISSING_MAX_CLOCK_SKEW", 400)
+	expectParamError("maxClockSkewUs out of range (zero)",
+		"clock=prft&maxClockSkewUs=0", "INVALID_MAX_CLOCK_SKEW", 400)
+	expectParamError("maxClockSkewUs out of range (above 1000000)",
+		"clock=prft&maxClockSkewUs=1000001", "INVALID_MAX_CLOCK_SKEW", 400)
+	expectParamError("maxClockSkewUs without clock=prft",
+		"maxClockSkewUs=1000", "INVALID_MAX_CLOCK_SKEW", 400)
+	expectParamError("unknown clock mode",
+		"clock=wall&maxClockSkewUs=1000", "UNKNOWN_CLOCK_MODE", 400)
+}
+
+// expectErrorQ is expectError with an explicit query string.
+func expectErrorQ(client *http.Client, base, query, name string, wantStatus int, wantCode string, wantSeg, wantFrag int, init []byte, segs ...[]byte) {
 	fmt.Printf("[reject] %s\n", name)
-	status, body, err := postAudit(client, base, init, segs...)
+	status, body, err := postAuditQ(client, base, query, init, segs...)
 	if err != nil {
 		fail("post: %v", err)
 		return
@@ -221,9 +382,20 @@ func expectError(client *http.Client, base, name string, wantStatus int, wantCod
 	pass("rejected with %s at segment %d fragment %d", e.Code, e.SegmentIndex, e.FragmentIndex)
 }
 
+// expectError posts init+segs and requires the given status, error code and
+// error indices.
+func expectError(client *http.Client, base, name string, wantStatus int, wantCode string, wantSeg, wantFrag int, init []byte, segs ...[]byte) {
+	expectErrorQ(client, base, "", name, wantStatus, wantCode, wantSeg, wantFrag, init, segs...)
+}
+
 // postAudit uploads one init segment and the given media segments as ordered
 // multipart parts and decodes the JSON response.
 func postAudit(client *http.Client, base string, init []byte, segs ...[]byte) (int, *auditResponse, error) {
+	return postAuditQ(client, base, "", init, segs...)
+}
+
+// postAuditQ is postAudit with an explicit query string (use "" for no query).
+func postAuditQ(client *http.Client, base, query string, init []byte, segs ...[]byte) (int, *auditResponse, error) {
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
 	writePart := func(name, filename string, data []byte) error {
@@ -249,7 +421,11 @@ func postAudit(client *http.Client, base string, init []byte, segs ...[]byte) (i
 		return 0, nil, err
 	}
 
-	req, err := http.NewRequest(http.MethodPost, base+"/api/fmp4/audit", &buf)
+	target := base + "/api/fmp4/audit"
+	if query != "" {
+		target += "?" + query
+	}
+	req, err := http.NewRequest(http.MethodPost, target, &buf)
 	if err != nil {
 		return 0, nil, err
 	}

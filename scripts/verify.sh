@@ -4,7 +4,7 @@
 #   1. go unit tests          (code tests)
 #   2. go vet + go build      (build checks)
 #   3. wait for API health
-#   4. HTTP smoke: continuous and broken decode timelines
+#   4. HTTP smoke: continuous/broken timelines and prft reference clock
 #
 # Exit code 0 = all checks passed, non-zero = failure.
 set -eu
@@ -33,7 +33,7 @@ if [ "$i" -ge 60 ]; then
   exit 1
 fi
 
-echo "[verify] 4/4 HTTP smoke tests (continuous + broken timelines)"
+echo "[verify] 4/4 HTTP smoke tests (timeline continuity + prft producer clock)"
 /tmp/fmp4-smoke -url "${API_URL}"
 
 echo "[verify] all checks passed"

@@ -83,6 +83,53 @@ part 字段名不限，顺序即语义。所有 part 合计不得超过 **16 MiB
 `segmentIndex` 为媒体片段在上传顺序中的 0 基序号；`fragmentIndex` 为所有 `moof`
 在提交顺序中的 0 基序号；初始化片段或请求级错误两者均为 `-1`。
 
+#### 可选 `clock=prft`：制作者参考时钟审计
+
+水声阵列录音机以制作者参考时钟（Producer Reference Time，`prft` 盒）对齐记录器。
+仅确认解码片段连续并不能发现媒体时钟漂移，因此可在请求上附加两个查询参数：
+
+```
+POST /api/fmp4/audit?clock=prft&maxClockSkewUs=1000
+```
+
+- `clock=prft`：启用参考时钟模式（唯一支持的取值）；
+- `maxClockSkewUs`：相邻锚点允许的最大时钟偏差（微秒），整数且在 **1..1_000_000**
+  之间，启用时必须与 `clock=prft` 同时提供。
+
+两者同时省略时，审计行为、错误优先级与接纳范围与原契约完全一致：不带参考时钟的
+旧素材照常接纳，即使片段里带有 `prft` 盒也会被忽略。只提供其中一个参数，或取值
+非法/不识别 `clock`，均以 `400` 与稳定错误码拒绝（见下表）。
+
+启用后，除既有的全部结构与连续时间线校验外，还要求：
+
+- 每个 `moof` 前**紧邻**一个**顶层 version 1** `prft` 盒（盒之间不得插入其它盒；
+  游离、错位或 version 0 的锚点一律拒收）；
+- `prft.reference_track_ID` 与初始化片段的轨道一致；
+- `prft.media_time` 等于对应片段的起始解码刻度（`tfdt.baseMediaDecodeTime`）；
+- 64 位 NTP 32.32 时间戳（`ntp_timestamp`）按提交顺序**严格递增**；
+- 相邻锚点之间，NTP 经过的时长与按轨道时标换算出的片段解码时长之差不超过
+  `maxClockSkewUs`（整数精确比较，无浮点误差）。
+
+成功响应在每个片段对象上**额外**返回 `mediaTime` 与 16 位小写十六进制的
+`ntpTimestamp`：
+
+```json
+{
+  "ok": true,
+  "timescale": 48000,
+  "trackId": 1,
+  "fragmentCount": 2,
+  "totalDuration": 6144,
+  "fragments": [
+    {"index": 0, "segmentIndex": 0, "sequenceNumber": 1, "start": 0,    "end": 3072, "duration": 3072, "samples": 3, "mediaTime": 0,    "ntpTimestamp": "0000000100000000"},
+    {"index": 1, "segmentIndex": 1, "sequenceNumber": 2, "start": 3072, "end": 6144, "duration": 3072, "samples": 3, "mediaTime": 3072, "ntpTimestamp": "0000000110624dd3"}
+  ]
+}
+```
+
+任何锚点缺失、归属错误、媒体时间不符、NTP 倒退或时钟漂移超限，都返回 `422` 与
+对应的片段索引、稳定错误码，据此明确拒收该阵列录音。
+
 ### `GET /healthz`
 
 健康检查，返回 `200 {"status":"ok"}`。容器内健康检查由二进制自身完成
@@ -97,6 +144,9 @@ part 字段名不限，顺序即语义。所有 part 合计不得超过 **16 MiB
 | `TOO_MANY_SEGMENTS` | 400 | 媒体片段超过 32 个 |
 | `PAYLOAD_TOO_LARGE` | 413 | 合计超过 16 MiB |
 | `METHOD_NOT_ALLOWED` | 405 | 非 POST 请求 |
+| `UNKNOWN_CLOCK_MODE` | 400 | `clock` 取值不被支持（仅支持 `prft`） |
+| `MISSING_MAX_CLOCK_SKEW` | 400 | 提供了 `clock=prft` 但未提供 `maxClockSkewUs` |
+| `INVALID_MAX_CLOCK_SKEW` | 400 | `maxClockSkewUs` 缺失配套参数、非整数或不在 1..1000000 内 |
 | `BOX_STRUCTURE_INVALID` | 422 | 盒大小/截断/版本等结构非法 |
 | `MISSING_MOOV` / `MISSING_MVEX` / `MISSING_TREX` | 422 | 初始化片段缺少必需盒 |
 | `TRACK_COUNT_INVALID` | 422 | 轨道数不为 1 |
@@ -112,6 +162,13 @@ part 字段名不限，顺序即语义。所有 part 合计不得超过 **16 MiB
 | `PAYLOAD_NOT_CONSUMED` | 422 | mdat 存在未被引用的字节 |
 | `TIMELINE_GAP` | 422 | 相邻解码区间存在空洞 |
 | `TIMELINE_OVERLAP` | 422 | 相邻解码区间存在重叠 |
+| `MISSING_PRFT` | 422 | `moof` 前缺少紧邻的顶层 `prft`（clock=prft） |
+| `PRFT_NOT_ADJACENT` | 422 | 顶层 `prft` 未紧邻其后的 `moof`（clock=prft） |
+| `PRFT_VERSION_UNSUPPORTED` | 422 | `prft` 不是 version 1（clock=prft） |
+| `PRFT_TRACK_MISMATCH` | 422 | `prft.reference_track_ID` 与初始化轨道不一致（clock=prft） |
+| `PRFT_MEDIA_TIME_MISMATCH` | 422 | `prft.media_time` 不等于片段起始刻度（clock=prft） |
+| `PRFT_NTP_NOT_INCREASING` | 422 | NTP 32.32 时间戳未按提交顺序严格递增（clock=prft） |
+| `CLOCK_DRIFT` | 422 | 相邻锚点 NTP 时长与轨道解码时长之差超过 `maxClockSkewUs`（clock=prft） |
 
 ## 交付结构
 
@@ -119,7 +176,7 @@ part 字段名不限，顺序即语义。所有 part 合计不得超过 **16 MiB
 Dockerfile            # 多阶段：build / runtime(scratch) / verify
 docker-compose.yml    # api（健康检查、API_PORT 可配宿主机端口）+ verify（一次性）
 cmd/server            # API 服务（含 healthcheck 子命令）
-cmd/smoke             # HTTP 冒烟客户端（连续 + 断裂时间线）
+cmd/smoke             # HTTP 冒烟客户端（连续/断裂时间线 + prft 参考时钟）
 internal/fmp4         # ISO BMFF 解析与审计逻辑
 internal/fixture      # 测试用 fMP4 构造器（单测与冒烟共用）
 scripts/verify.sh     # verify 服务入口：go test → vet/build → 等待健康 → 冒烟

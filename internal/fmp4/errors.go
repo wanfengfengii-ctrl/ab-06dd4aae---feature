@@ -13,6 +13,11 @@ const (
 	CodeTooManySegments  = "TOO_MANY_SEGMENTS"
 	CodeMethodNotAllowed = "METHOD_NOT_ALLOWED"
 
+	// clock=prft request parameters.
+	CodeUnknownClockMode    = "UNKNOWN_CLOCK_MODE"
+	CodeMissingMaxClockSkew = "MISSING_MAX_CLOCK_SKEW"
+	CodeInvalidMaxClockSkew = "INVALID_MAX_CLOCK_SKEW"
+
 	// Box structure (init or media segment).
 	CodeBoxStructureInvalid = "BOX_STRUCTURE_INVALID"
 	CodeMissingMoov         = "MISSING_MOOV"
@@ -47,6 +52,15 @@ const (
 	// Decode timeline continuity.
 	CodeTimelineGap     = "TIMELINE_GAP"
 	CodeTimelineOverlap = "TIMELINE_OVERLAP"
+
+	// Producer reference time (prft) clock anchoring, clock=prft only.
+	CodeMissingPrft        = "MISSING_PRFT"
+	CodePrftNotAdjacent    = "PRFT_NOT_ADJACENT"
+	CodePrftVersion        = "PRFT_VERSION_UNSUPPORTED"
+	CodePrftTrackMismatch  = "PRFT_TRACK_MISMATCH"
+	CodePrftMediaTime      = "PRFT_MEDIA_TIME_MISMATCH"
+	CodePrftNtpNotIncrease = "PRFT_NTP_NOT_INCREASING"
+	CodeClockDrift         = "CLOCK_DRIFT"
 )
 
 // AuditError describes a single rejected submission. SegmentIndex is the

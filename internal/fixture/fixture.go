@@ -132,6 +132,31 @@ func buildTrak(trackID uint32, handler string, timescale uint32) []byte {
 	return Box("trak", cat(tkhd, mdia))
 }
 
+// PrftPlacement selects where an optional prft box is emitted relative to the
+// moof in a media segment.
+type PrftPlacement int
+
+const (
+	// PrftBeforeMoof places the prft directly before the moof (the only
+	// clock=prft-legal position).
+	PrftBeforeMoof PrftPlacement = iota
+	// PrftBeforeMoofWithGap inserts a free box between prft and moof.
+	PrftBeforeMoofWithGap
+	// PrftAfterMoof places the prft between the moof and mdat.
+	PrftAfterMoof
+	// PrftSegmentEnd places the prft after the mdat.
+	PrftSegmentEnd
+)
+
+// PrftOpts describes an optional top-level producer reference time box.
+type PrftOpts struct {
+	TrackID   uint32 // reference_track_ID; default 1
+	Ntp       uint64 // 64-bit NTP 32.32 timestamp
+	MediaTime uint64 // media_time (track timescale ticks)
+	V0        bool   // emit full-box version 0 (32-bit media_time); default is version 1
+	Placement PrftPlacement
+}
+
 // MediaOpts configures MediaSegment.
 type MediaOpts struct {
 	Seq          uint32
@@ -151,6 +176,9 @@ type MediaOpts struct {
 	MdatTruncate  int    // shrink mdat payload by this many bytes
 	DataOffset    *int32 // explicit data_offset for the first trun
 	SecondOverlap uint32 // shift second trun's data_offset back by this many bytes
+
+	// Prft, when non-nil, emits a top-level prft box described by the options.
+	Prft *PrftOpts
 }
 
 // MediaSegment builds an fMP4 media segment: styp, moof(mfhd, traf(tfhd,
@@ -236,7 +264,37 @@ func MediaSegment(o MediaOpts) []byte {
 	}
 
 	styp := Box("styp", cat([]byte("msdh"), be32(0), []byte("msdhmsix")))
-	return cat(styp, moof, mdat)
+
+	var prft []byte
+	if o.Prft != nil {
+		p := o.Prft
+		trackID := p.TrackID
+		if trackID == 0 {
+			trackID = 1
+		}
+		body := cat(be32(trackID), be64(p.Ntp))
+		if p.V0 {
+			prft = fullBox("prft", 0, 0, cat(body, be32(uint32(p.MediaTime))))
+		} else {
+			prft = fullBox("prft", 1, 0, cat(body, be64(p.MediaTime)))
+		}
+	}
+	free := Box("free", make([]byte, 8))
+
+	parts := [][]byte{styp}
+	switch {
+	case o.Prft == nil:
+		parts = append(parts, moof, mdat)
+	case o.Prft.Placement == PrftBeforeMoof:
+		parts = append(parts, prft, moof, mdat)
+	case o.Prft.Placement == PrftBeforeMoofWithGap:
+		parts = append(parts, prft, free, moof, mdat)
+	case o.Prft.Placement == PrftAfterMoof:
+		parts = append(parts, moof, prft, mdat)
+	default: // PrftSegmentEnd
+		parts = append(parts, moof, mdat, prft)
+	}
+	return cat(parts...)
 }
 
 func totalSize(samples []Sample) int {

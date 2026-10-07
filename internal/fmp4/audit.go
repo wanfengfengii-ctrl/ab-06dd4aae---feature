@@ -1,5 +1,10 @@
 package fmp4
 
+import (
+	"fmt"
+	"math/big"
+)
+
 // tfhd / trun flag bits (ISO/IEC 14496-12).
 const (
 	tfhdBaseDataOffsetPresent       = 0x000001
@@ -24,6 +29,14 @@ type FragmentReport struct {
 	End            uint64 `json:"end"`
 	Duration       uint64 `json:"duration"`
 	Samples        uint32 `json:"samples"`
+
+	// Producer reference time, populated only in clock=prft mode. MediaTime
+	// is the prft media_time (track timescale ticks); NtpTimestamp is the
+	// 64-bit NTP 32.32 timestamp rendered as 16 lowercase hex digits.
+	// Pointers keep the fields present in prft mode (even for a legitimate 0)
+	// and entirely absent from the legacy response.
+	MediaTime    *uint64 `json:"mediaTime,omitempty"`
+	NtpTimestamp *string `json:"ntpTimestamp,omitempty"`
 }
 
 // Report is the result of a successful audit.
@@ -33,6 +46,26 @@ type Report struct {
 	FragmentCount int
 	TotalDuration uint64
 	Fragments     []FragmentReport
+}
+
+// ClockMode selects which time base an audit enforces.
+type ClockMode int
+
+const (
+	// ClockDecode only enforces decode-timeline continuity (the legacy
+	// contract); prft boxes, if present, are ignored.
+	ClockDecode ClockMode = iota
+	// ClockPrft additionally requires a top-level version 1 prft directly
+	// before every moof and checks the anchored producer clock for drift
+	// against the track timeline.
+	ClockPrft
+)
+
+// Options parameterizes an audit. The zero value reproduces the legacy
+// Audit(init, segs) contract exactly.
+type Options struct {
+	Clock          ClockMode
+	MaxClockSkewUs int64 // required, and 1..1_000_000, when Clock == ClockPrft
 }
 
 // initTrack carries the per-track facts recovered from the init segment.
@@ -50,12 +83,27 @@ type fragment struct {
 	start        uint64
 	duration     uint64
 	samples      uint32
+	prft         *prftInfo
+}
+
+// prftInfo is the producer reference time anchored to one fragment.
+type prftInfo struct {
+	trackID   uint32
+	mediaTime uint64
+	ntp       uint64
 }
 
 // Audit validates one initialization segment followed by one or more media
 // segments and returns the reconstructed decode timeline. Any violation is
-// reported as a single *AuditError with a stable code.
+// reported as a single *AuditError with a stable code. It is equivalent to
+// AuditWithOptions with the zero Options (decode clock only).
 func Audit(initBuf []byte, segs [][]byte) (*Report, *AuditError) {
+	return AuditWithOptions(initBuf, segs, Options{})
+}
+
+// AuditWithOptions behaves like Audit but additionally, in clock=prft mode,
+// requires and validates a producer reference time box before every moof.
+func AuditWithOptions(initBuf []byte, segs [][]byte, opts Options) (*Report, *AuditError) {
 	init, aerr := parseInit(initBuf)
 	if aerr != nil {
 		return nil, aerr
@@ -63,7 +111,7 @@ func Audit(initBuf []byte, segs [][]byte) (*Report, *AuditError) {
 
 	var frags []fragment
 	for i, seg := range segs {
-		fs, aerr := parseMediaSegment(seg, i, init, len(frags))
+		fs, aerr := parseMediaSegment(seg, i, init, len(frags), opts)
 		if aerr != nil {
 			return nil, aerr
 		}
@@ -91,13 +139,19 @@ func Audit(initBuf []byte, segs [][]byte) (*Report, *AuditError) {
 		}
 	}
 
+	if opts.Clock == ClockPrft {
+		if aerr := checkClock(frags, init.trackID, init.timescale, opts.MaxClockSkewUs); aerr != nil {
+			return nil, aerr
+		}
+	}
+
 	rep := &Report{
 		Timescale:     init.timescale,
 		TrackID:       init.trackID,
 		FragmentCount: len(frags),
 	}
 	for i, f := range frags {
-		rep.Fragments = append(rep.Fragments, FragmentReport{
+		fr := FragmentReport{
 			Index:          i,
 			SegmentIndex:   f.segmentIndex,
 			SequenceNumber: f.seq,
@@ -105,7 +159,14 @@ func Audit(initBuf []byte, segs [][]byte) (*Report, *AuditError) {
 			End:            f.start + f.duration,
 			Duration:       f.duration,
 			Samples:        f.samples,
-		})
+		}
+		if opts.Clock == ClockPrft {
+			mt := f.prft.mediaTime
+			ntp := fmt.Sprintf("%016x", f.prft.ntp)
+			fr.MediaTime = &mt
+			fr.NtpTimestamp = &ntp
+		}
+		rep.Fragments = append(rep.Fragments, fr)
 	}
 	if len(frags) > 0 {
 		first, last := frags[0], frags[len(frags)-1]
@@ -295,8 +356,9 @@ func parseTrex(b *box) (trackID, defDur, defSize uint32, aerr *AuditError) {
 // parseMediaSegment audits one media segment: every moof must describe the
 // init segment's track, resolve all sample parameters, and reference payload
 // bytes that exist inside the segment's mdat box(es). fragBase is the global
-// fragment index of the segment's first moof.
-func parseMediaSegment(buf []byte, segIdx int, init *initTrack, fragBase int) ([]fragment, *AuditError) {
+// fragment index of the segment's first moof. In clock=prft mode every moof
+// must be immediately preceded at top level by a version 1 prft box.
+func parseMediaSegment(buf []byte, segIdx int, init *initTrack, fragBase int, opts Options) ([]fragment, *AuditError) {
 	tops, aerr := parseBoxes(buf, 0, segIdx, fragBase)
 	if aerr != nil {
 		return nil, aerr
@@ -308,12 +370,46 @@ func parseMediaSegment(buf []byte, segIdx int, init *initTrack, fragBase int) ([
 	}
 	mdats := findBoxes(tops, "mdat")
 
+	// In prft mode every top-level moof must have a prft directly before it
+	// (and every prft must be directly followed by that moof); prftForMoof[k]
+	// is the top-level index of the anchoring prft for moofs[k].
+	prftForMoof := make([]int, len(moofs))
+	if opts.Clock == ClockPrft {
+		k := 0
+		for i := range tops {
+			switch tops[i].typ {
+			case "moof":
+				if i == 0 || tops[i-1].typ != "prft" {
+					return nil, errf(CodeMissingPrft, segIdx, fragBase+k,
+						"fragment %d has no top-level prft box immediately before its moof",
+						fragBase+k)
+				}
+				prftForMoof[k] = i - 1
+				k++
+			case "prft":
+				if i+1 >= len(tops) || tops[i+1].typ != "moof" {
+					return nil, errf(CodePrftNotAdjacent, segIdx, fragBase+k,
+						"top-level prft box at offset %d is not immediately followed by a moof",
+						tops[i].start)
+				}
+			}
+		}
+	}
+
 	var frags []fragment
 	var ranges []payloadRange
 	for i := range moofs {
 		f, rs, aerr := parseMoof(&moofs[i], segIdx, fragBase+i, init)
 		if aerr != nil {
 			return nil, aerr
+		}
+		if opts.Clock == ClockPrft {
+			pb := tops[prftForMoof[i]]
+			pr, aerr := parsePrft(&pb, segIdx, fragBase+i)
+			if aerr != nil {
+				return nil, aerr
+			}
+			f.prft = pr
 		}
 		frags = append(frags, *f)
 		ranges = append(ranges, rs...)
@@ -325,6 +421,86 @@ func parseMediaSegment(buf []byte, segIdx int, init *initTrack, fragBase int) ([
 		return nil, aerr
 	}
 	return frags, nil
+}
+
+// parsePrft parses a top-level producer reference time box (ISO/IEC 14496-12
+// 8.16.5). Only version 1 is accepted: its body carries a 64-bit NTP 32.32
+// timestamp and a 64-bit media_time.
+func parsePrft(b *box, seg, frag int) (*prftInfo, *AuditError) {
+	version, _, body, aerr := fullBox(b, seg, frag)
+	if aerr != nil {
+		return nil, aerr
+	}
+	if version != 1 {
+		return nil, errf(CodePrftVersion, seg, frag,
+			"prft before fragment %d is version %d, expected version 1", frag, version)
+	}
+	c := &cursor{b: body}
+	trackID, ok := c.u32()
+	if !ok {
+		return nil, errf(CodeBoxStructureInvalid, seg, frag, "prft truncated at reference_track_ID")
+	}
+	ntp, ok := c.u64()
+	if !ok {
+		return nil, errf(CodeBoxStructureInvalid, seg, frag, "prft truncated at ntp_timestamp")
+	}
+	mediaTime, ok := c.u64()
+	if !ok {
+		return nil, errf(CodeBoxStructureInvalid, seg, frag, "prft truncated at media_time")
+	}
+	return &prftInfo{trackID: trackID, mediaTime: mediaTime, ntp: ntp}, nil
+}
+
+// checkClock cross-validates the producer reference time anchors in prft
+// clock mode: each prft must name the init track and anchor the fragment's
+// start tick, NTP timestamps must strictly increase in submission order, and
+// the elapsed NTP time between neighboring anchors must match the decoded
+// duration on the track timescale within maxSkewUs microseconds.
+func checkClock(frags []fragment, trackID uint32, timescale uint32, maxSkewUs int64) *AuditError {
+	for i := range frags {
+		f := &frags[i]
+		p := f.prft
+		if p.trackID != trackID {
+			return errf(CodePrftTrackMismatch, f.segmentIndex, i,
+				"fragment %d prft reference_track_ID %d does not match init segment track %d",
+				i, p.trackID, trackID)
+		}
+		if p.mediaTime != f.start {
+			return errf(CodePrftMediaTime, f.segmentIndex, i,
+				"fragment %d prft media_time is %d but the fragment starts at decode tick %d",
+				i, p.mediaTime, f.start)
+		}
+		if i == 0 {
+			continue
+		}
+		prev := frags[i-1].prft
+		if p.ntp <= prev.ntp {
+			return errf(CodePrftNtpNotIncrease, f.segmentIndex, i,
+				"fragment %d prft ntp_timestamp %016x does not strictly follow previous %016x",
+				i, p.ntp, prev.ntp)
+		}
+
+		// Exact integer form of
+		//   |ntpDelta/2^32 - tickDelta/timescale| <= maxSkewUs/1e6
+		// using big.Int so large 64-bit products never overflow.
+		ntpDelta := new(big.Int).SetUint64(p.ntp - prev.ntp)
+		tickDelta := new(big.Int).SetUint64(f.start - frags[i-1].start)
+
+		diff := new(big.Int).Mul(ntpDelta, big.NewInt(int64(timescale)))
+		diff.Sub(diff, new(big.Int).Lsh(tickDelta, 32))
+		diff.Abs(diff)
+		diff.Mul(diff, big.NewInt(1_000_000))
+
+		limit := new(big.Int).Lsh(big.NewInt(int64(timescale)), 32)
+		limit.Mul(limit, big.NewInt(maxSkewUs))
+
+		if diff.Cmp(limit) > 0 {
+			return errf(CodeClockDrift, f.segmentIndex, i,
+				"fragment %d producer clock drifted beyond %d us between anchors %016x and %016x",
+				i, maxSkewUs, prev.ntp, p.ntp)
+		}
+	}
+	return nil
 }
 
 // payloadRange is one trun's media byte extent inside a segment.

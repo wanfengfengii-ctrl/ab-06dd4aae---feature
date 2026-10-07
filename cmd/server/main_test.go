@@ -53,6 +53,19 @@ func post(t *testing.T, body *bytes.Buffer, contentType string) (int, map[string
 	return rec.Code, parsed
 }
 
+func postURL(t *testing.T, target string, body *bytes.Buffer, contentType string) (int, map[string]any) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, target, body)
+	req.Header.Set("Content-Type", contentType)
+	rec := httptest.NewRecorder()
+	routes().ServeHTTP(rec, req)
+	var parsed map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &parsed); err != nil {
+		t.Fatalf("response is not JSON: %v (%s)", err, rec.Body.String())
+	}
+	return rec.Code, parsed
+}
+
 func goodInit() []byte {
 	return fixture.InitSegment(fixture.InitOpts{
 		Timescale: 48000, TrackID: 1, TrexDuration: 1024, TrexSize: 16,
@@ -171,5 +184,128 @@ func TestHandlerHealth(t *testing.T) {
 	routes().ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status %d", rec.Code)
+	}
+}
+
+// ---- clock=prft ----
+
+// anchoredSeg builds a fragment with a version 1 prft directly before moof.
+func anchoredSeg(seq uint32, base, ntp uint64) []byte {
+	return fixture.MediaSegment(fixture.MediaOpts{
+		Seq: seq, BaseTime: base, Samples: fixture.Samples(3, 1024, 16),
+		Prft: &fixture.PrftOpts{Ntp: ntp, MediaTime: base},
+	})
+}
+
+const ntpStep = uint64(274_877_907) // 3072 ticks @48kHz in NTP 32.32
+
+func TestHandlerPrftOK(t *testing.T) {
+	base := uint64(1) << 32
+	body, ct := buildMultipart(t, goodInit(),
+		anchoredSeg(1, 0, base),
+		anchoredSeg(2, 3072, base+ntpStep))
+	status, resp := postURL(t, "/api/fmp4/audit?clock=prft&maxClockSkewUs=1000", body, ct)
+	if status != http.StatusOK {
+		t.Fatalf("status %d, resp %v", status, resp)
+	}
+	frags, ok := resp["fragments"].([]any)
+	if !ok || len(frags) != 2 {
+		t.Fatalf("fragments=%v", resp["fragments"])
+	}
+	f0 := frags[0].(map[string]any)
+	if f0["mediaTime"] != 0.0 || f0["ntpTimestamp"] != "0000000100000000" {
+		t.Fatalf("fragment 0 anchors: %v", f0)
+	}
+	f1 := frags[1].(map[string]any)
+	if f1["mediaTime"] != 3072.0 || f1["ntpTimestamp"] != "0000000110624dd3" {
+		t.Fatalf("fragment 1 anchors: %v", f1)
+	}
+}
+
+func TestHandlerPrftMissingParam(t *testing.T) {
+	body, ct := buildMultipart(t, goodInit(), anchoredSeg(1, 0, 1<<32))
+	status, resp := postURL(t, "/api/fmp4/audit?clock=prft", body, ct)
+	if status != http.StatusBadRequest || errorCode(t, resp) != "MISSING_MAX_CLOCK_SKEW" {
+		t.Fatalf("status %d resp %v", status, resp)
+	}
+
+	status, resp = postURL(t, "/api/fmp4/audit?clock=prft&maxClockSkewUs=", body, ct)
+	if status != http.StatusBadRequest || errorCode(t, resp) != "MISSING_MAX_CLOCK_SKEW" {
+		t.Fatalf("status %d resp %v", status, resp)
+	}
+}
+
+func TestHandlerPrftInvalidParam(t *testing.T) {
+	body, ct := buildMultipart(t, goodInit(), anchoredSeg(1, 0, 1<<32))
+	for _, q := range []string{
+		"clock=prft&maxClockSkewUs=0",
+		"clock=prft&maxClockSkewUs=-5",
+		"clock=prft&maxClockSkewUs=1000001",
+		"clock=prft&maxClockSkewUs=abc",
+		"maxClockSkewUs=1000",
+	} {
+		status, resp := postURL(t, "/api/fmp4/audit?"+q, body, ct)
+		if status != http.StatusBadRequest || errorCode(t, resp) != "INVALID_MAX_CLOCK_SKEW" {
+			t.Fatalf("query %q: status %d resp %v", q, status, resp)
+		}
+	}
+}
+
+func TestHandlerUnknownClockMode(t *testing.T) {
+	body, ct := buildMultipart(t, goodInit(), anchoredSeg(1, 0, 1<<32))
+	status, resp := postURL(t, "/api/fmp4/audit?clock=wall&maxClockSkewUs=1000", body, ct)
+	if status != http.StatusBadRequest || errorCode(t, resp) != "UNKNOWN_CLOCK_MODE" {
+		t.Fatalf("status %d resp %v", status, resp)
+	}
+}
+
+func TestHandlerPrftMissingAnchor(t *testing.T) {
+	// Legacy segments without prft are rejected under clock=prft.
+	body, ct := buildMultipart(t, goodInit(), goodSeg(1, 0), goodSeg(2, 3072))
+	status, resp := postURL(t, "/api/fmp4/audit?clock=prft&maxClockSkewUs=1000", body, ct)
+	if status != http.StatusUnprocessableEntity {
+		t.Fatalf("status %d resp %v", status, resp)
+	}
+	if code := errorCode(t, resp); code != "MISSING_PRFT" {
+		t.Fatalf("code %q", code)
+	}
+	e := resp["error"].(map[string]any)
+	if e["fragmentIndex"] != 0.0 || e["segmentIndex"] != 0.0 {
+		t.Fatalf("indices %v/%v", e["segmentIndex"], e["fragmentIndex"])
+	}
+}
+
+func TestHandlerPrftClockDrift(t *testing.T) {
+	// ~1 ms of extra producer time between the two anchors, 1 us threshold.
+	body, ct := buildMultipart(t, goodInit(),
+		anchoredSeg(1, 0, 1<<32),
+		anchoredSeg(2, 3072, 1<<32+ntpStep+4295))
+	status, resp := postURL(t, "/api/fmp4/audit?clock=prft&maxClockSkewUs=1", body, ct)
+	if status != http.StatusUnprocessableEntity {
+		t.Fatalf("status %d resp %v", status, resp)
+	}
+	if code := errorCode(t, resp); code != "CLOCK_DRIFT" {
+		t.Fatalf("code %q", code)
+	}
+	e := resp["error"].(map[string]any)
+	if e["fragmentIndex"] != 1.0 || e["segmentIndex"] != 1.0 {
+		t.Fatalf("indices %v/%v", e["segmentIndex"], e["fragmentIndex"])
+	}
+}
+
+func TestHandlerLegacyMaterialAcceptedWithoutClock(t *testing.T) {
+	// No clock parameter: anchored or unanchored segments follow the original
+	// contract, and no prft fields appear in the response.
+	body, ct := buildMultipart(t, goodInit(), goodSeg(1, 0), goodSeg(2, 3072))
+	status, resp := post(t, body, ct)
+	if status != http.StatusOK {
+		t.Fatalf("status %d resp %v", status, resp)
+	}
+	f0 := resp["fragments"].([]any)[0].(map[string]any)
+	if _, present := f0["mediaTime"]; present {
+		t.Fatalf("mediaTime must be omitted in legacy mode: %v", f0)
+	}
+	if _, present := f0["ntpTimestamp"]; present {
+		t.Fatalf("ntpTimestamp must be omitted in legacy mode: %v", f0)
 	}
 }
